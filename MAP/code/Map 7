@@ -1,0 +1,201 @@
+import time
+import random
+import cv2
+import numpy as np
+import pyautogui
+from pythonosc.udp_client import SimpleUDPClient
+
+
+def draw_cursor(frame, x, y, cursor_img):
+    cursor_h, cursor_w = cursor_img.shape[:2]
+    frame_h, frame_w = frame.shape[:2]
+
+    # Calculate top-left corner
+    x1 = int(x - cursor_w / 2)
+    y1 = int(y - cursor_h / 2)
+    x2 = x1 + cursor_w
+    y2 = y1 + cursor_h
+
+    # Clip coordinates to frame bounds
+    x1_clip = max(0, x1)
+    y1_clip = max(0, y1)
+    x2_clip = min(frame_w, x2)
+    y2_clip = min(frame_h, y2)
+
+    # Corresponding crop from cursor image
+    cursor_x1 = x1_clip - x1
+    cursor_y1 = y1_clip - y1
+    cursor_x2 = cursor_x1 + (x2_clip - x1_clip)
+    cursor_y2 = cursor_y1 + (y2_clip - y1_clip)
+
+    # Crop cursor image
+    cursor_crop = cursor_img[cursor_y1:cursor_y2, cursor_x1:cursor_x2]
+
+    # Overlay using alpha channel if exists
+    if cursor_crop.shape[2] == 4:
+        alpha = cursor_crop[:, :, 3] / 255.0
+        for c in range(3):
+            frame[y1_clip:y2_clip, x1_clip:x2_clip, c] = (
+                alpha * cursor_crop[:, :, c] + (1 - alpha) * frame[y1_clip:y2_clip, x1_clip:x2_clip, c]
+            )
+    else:
+        frame[y1_clip:y2_clip, x1_clip:x2_clip] = cursor_crop
+
+    return frame
+
+
+def apply_shake(frame: np.ndarray, dx: float, dy: float) -> np.ndarray:
+    h, w = frame.shape[:2]
+    M = np.float32([[1, 0, dx], [0, 1, dy]])
+    return cv2.warpAffine(frame, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+
+def to_black_and_white(frame: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
+def vhs_glitch_effect(frame: np.ndarray) -> np.ndarray:
+    h, w = frame.shape[:2]
+    glitch = frame.copy()
+    for i in range(0, h, 20):
+        offset = random.randint(-10, 10)
+        glitch[i:i+5, :] = np.roll(glitch[i:i+5, :], offset, axis=1)
+    return glitch
+
+
+def pixelate(frame: np.ndarray, scale: int = 10) -> np.ndarray:
+    h, w = frame.shape[:2]
+    temp = cv2.resize(frame, (w // scale, h // scale), interpolation=cv2.INTER_LINEAR)
+    return cv2.resize(temp, (w, h), interpolation=cv2.INTER_NEAREST)
+
+
+def main():
+    # --- Configuration ---
+    video_path = "/Users/alexsuarez/desktop/MAP/media assets/desktopxp.mp4"  # <-- set your video file path
+    cursor_image_path = "/Users/alexsuarez/desktop/map/media assets/cursor2.png"  # <-- set your cursor PNG path
+    window_name = "Live Effects"
+    osc_ip = "127.0.0.1"
+    osc_port = 8000
+    osc_address = "/cursor"
+    normalize_osc = True
+    shake_strength = 60.0
+    shake_duration = 0.40
+    osc_interval = 0.05  # seconds
+
+    # Load cursor image
+    cursor_img = cv2.imread(cursor_image_path, cv2.IMREAD_UNCHANGED)
+    if cursor_img is None:
+        print(f"Error: Could not load cursor image: {cursor_image_path}")
+        return
+
+    # Initialize OSC client
+    osc_client = SimpleUDPClient(osc_ip, osc_port)
+    last_osc_time = 0
+
+    # Screen size for normalization
+    screen_w, screen_h = pyautogui.size()
+
+    # Open video file
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Error: Could not open video file: {video_path}")
+        return
+
+    src_fps = cap.get(cv2.CAP_PROP_FPS)
+    if not src_fps or src_fps <= 1.0:
+        src_fps = 30.0
+    frame_delay_ms = int(1000.0 / src_fps)
+
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+    # --- Effect state ---
+    shake_active = False
+    shake_start = 0.0
+    bw_mode = False
+    glitch_mode = False
+    pixelate_mode = False
+
+    print("Controls:")
+    print("  A - Shake")
+    print("  S - Toggle Black/White")
+    print("  D - Toggle VHS Glitch")
+    print("  F - Toggle Pixelate")
+    print("  Q - Quit")
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            # Loop video
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            continue
+
+        # Apply effects
+        if bw_mode:
+            frame = to_black_and_white(frame)
+
+        if shake_active:
+            t = time.time() - shake_start
+            if t >= shake_duration:
+                shake_active = False
+                dx = dy = 0
+            else:
+                progress = t / shake_duration
+                decay = (1.0 - progress) ** 2
+                strength = shake_strength * decay
+                dx = random.uniform(-strength, strength)
+                dy = random.uniform(-strength, strength)
+                frame = apply_shake(frame, dx, dy)
+        else:
+            dx = dy = 0
+
+        if glitch_mode:
+            frame = vhs_glitch_effect(frame)
+
+        if pixelate_mode:
+            frame = pixelate(frame, scale=10)
+
+        # Get cursor position
+        cursor_x, cursor_y = pyautogui.position()
+
+        # --- Send OSC ---
+        now = time.time()
+        if now - last_osc_time >= osc_interval:
+            if normalize_osc:
+                osc_x = cursor_x / screen_w
+                osc_y = cursor_y / screen_h
+            else:
+                osc_x = cursor_x
+                osc_y = cursor_y
+            osc_client.send_message(osc_address, [osc_x, osc_y])
+            last_osc_time = now
+
+        # --- Draw custom cursor ---
+        frame_h, frame_w = frame.shape[:2]
+        x_scaled = int(cursor_x / screen_w * frame_w + dx)
+        y_scaled = int(cursor_y / screen_h * frame_h + dy)
+        frame = draw_cursor(frame, x_scaled, y_scaled, cursor_img)
+
+        cv2.imshow(window_name, frame)
+
+        key = cv2.waitKey(frame_delay_ms) & 0xFF
+        if key != 255:
+            ch = chr(key).lower()
+            if ch == "a":
+                shake_active = True
+                shake_start = time.time()
+            elif ch == "s":
+                bw_mode = not bw_mode
+            elif ch == "d":
+                glitch_mode = not glitch_mode
+            elif ch == "f":
+                pixelate_mode = not pixelate_mode
+            elif ch == "q":
+                break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
