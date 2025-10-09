@@ -15,7 +15,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TRANSCRIPT_FILES = [os.path.join(SCRIPT_DIR, "q1.txt"), os.path.join(SCRIPT_DIR, "q2.txt"), os.path.join(SCRIPT_DIR, "q3.txt") ]
 
 
-client = OpenAI(api_key="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")
+#client = OpenAI(api_key="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")
 
 # ─── FUNCTIONS ──────────────────────────────────────────────────────────────────
 def load_transcripts():
