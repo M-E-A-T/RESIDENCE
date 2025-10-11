@@ -1,0 +1,5 @@
+FROM <model name>
+PARAMETER temperature 1 # see param page on github
+SYSTEM """
+NUMINA SETTINGS GO HERE
+"""
