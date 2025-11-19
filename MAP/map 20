@@ -1,0 +1,443 @@
+import time
+import random
+import cv2
+import numpy as np
+import pyautogui
+from pythonosc.udp_client import SimpleUDPClient
+import moderngl
+from pathlib import Path
+from PIL import Image
+
+# -------------------------------
+# Dynamic Asset Folder
+# -------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+ASSETS = BASE_DIR / "media assets"
+
+def asset(name: str) -> str:
+    """Helper to access assets cleanly."""
+    return str(ASSETS / name)
+
+# -------------------------------
+# Mouse Callback
+# -------------------------------
+mouse_clicked = False
+dragging = False
+drag_start = (0, 0)
+drag_end = (0, 0)
+
+def on_mouse(event, x, y, flags, param):
+    global mouse_clicked, dragging, drag_start, drag_end, sc_client
+    if event == cv2.EVENT_LBUTTONDOWN:
+        mouse_clicked = True
+        dragging = True
+        drag_start = (x, y)
+        drag_end = (x, y)
+        try:
+            sc_client.send_message("/play_sfx", [])
+        except Exception as e:
+            print(f"Error sending OSC to SuperCollider (click sfx): {e}")
+    elif event == cv2.EVENT_MOUSEMOVE:
+        if dragging:
+            drag_end = (x, y)
+    elif event == cv2.EVENT_LBUTTONUP:
+        dragging = False
+        drag_end = (x, y)
+
+# -------------------------------
+# GLSL Setup
+# -------------------------------
+def create_glsl_context(width, height):
+    ctx = moderngl.create_standalone_context()
+    vertex_shader = '''
+    #version 330
+    in vec2 in_vert;
+    in vec2 in_tex;
+    out vec2 uv;
+    void main() {
+        gl_Position = vec4(in_vert, 0.0, 1.0);
+        uv = in_tex;
+    }
+    '''
+    fragment_shader = '''
+    #version 330
+    uniform sampler2D fromTex;
+    uniform sampler2D toTex;
+    uniform float progress;
+    uniform float amplitude;
+    uniform float speed;
+
+    in vec2 uv;
+    out vec4 fragColor;
+
+    void main() {
+        vec2 dir = uv - vec2(0.5);
+        float dist = length(dir);
+        vec4 fromColor = texture(fromTex, uv);
+        vec4 toColor = texture(toTex, uv);
+        vec4 color;
+
+        if (dist > progress) {
+            color = mix(fromColor, toColor, progress);
+        } else {
+            vec2 offset = dir * sin(dist * amplitude - progress * speed);
+            color = mix(texture(fromTex, uv + offset), toColor, progress);
+        }
+
+        fragColor = color;
+    }
+    '''
+    prog = ctx.program(vertex_shader=vertex_shader, fragment_shader=fragment_shader)
+    quad = ctx.buffer(np.array([
+        -1.0, -1.0, 0.0, 0.0,
+         1.0, -1.0, 1.0, 0.0,
+        -1.0,  1.0, 0.0, 1.0,
+         1.0,  1.0, 1.0, 1.0,
+    ], dtype='f4').tobytes())
+    vao = ctx.vertex_array(prog, [(quad, '2f 2f', 'in_vert', 'in_tex')])
+    fbo = ctx.simple_framebuffer((width, height))
+    return ctx, prog, vao, fbo
+
+def apply_glsl_transition(ctx, prog, vao, fbo, frame_a, frame_b, progress, amplitude=30.0, speed=30.0):
+    frame_a_rgb = cv2.cvtColor(frame_a, cv2.COLOR_BGR2RGB)
+    frame_b_rgb = cv2.cvtColor(frame_b, cv2.COLOR_BGR2RGB)
+    img_a = Image.fromarray(frame_a_rgb)
+    img_b = Image.fromarray(frame_b_rgb)
+
+    tex_a = ctx.texture(img_a.size, 3, img_a.tobytes())
+    tex_b = ctx.texture(img_b.size, 3, img_b.tobytes())
+
+    tex_a.use(location=0)
+    tex_b.use(location=1)
+    prog["fromTex"] = 0
+    prog["toTex"] = 1
+    prog["progress"] = progress
+    prog["amplitude"] = amplitude
+    prog["speed"] = speed
+
+    fbo.use()
+    vao.render(moderngl.TRIANGLE_STRIP)
+    data = fbo.read(components=3)
+    result = np.frombuffer(data, dtype=np.uint8).reshape((img_a.height, img_a.width, 3))
+    return cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
+
+# -------------------------------
+# Utility / Effects
+# -------------------------------
+def draw_cursor(frame, x, y, cursor_img):
+    cursor_h, cursor_w = cursor_img.shape[:2]
+    frame_h, frame_w = frame.shape[:2]
+    x1 = int(x - cursor_w / 2)
+    y1 = int(y - cursor_h / 2)
+    x2 = x1 + cursor_w
+    y2 = y1 + cursor_h
+    x1_clip = max(0, x1)
+    y1_clip = max(0, y1)
+    x2_clip = min(frame_w, x2)
+    y2_clip = min(frame_h, y2)
+    cursor_x1 = x1_clip - x1
+    cursor_y1 = y1_clip - y1
+    cursor_x2 = cursor_x1 + (x2_clip - x1_clip)
+    cursor_y2 = cursor_y1 + (y2_clip - y1_clip)
+    cursor_crop = cursor_img[cursor_y1:cursor_y2, cursor_x1:cursor_x2]
+    if cursor_crop.shape[2] == 4:
+        alpha = cursor_crop[:, :, 3] / 255.0
+        for c in range(3):
+            frame[y1_clip:y2_clip, x1_clip:x2_clip, c] = (
+                alpha * cursor_crop[:, :, c] + (1 - alpha) * frame[y1_clip:y2_clip, x1_clip:x2_clip, c]
+            )
+    else:
+        frame[y1_clip:y2_clip, x1_clip:x2_clip] = cursor_crop
+    return frame
+
+def apply_shake(frame, dx, dy):
+    h, w = frame.shape[:2]
+    M = np.float32([[1, 0, dx], [0, 1, dy]])
+    return cv2.warpAffine(frame, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+def to_black_and_white(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+def vhs_glitch_effect(frame):
+    h, w = frame.shape[:2]
+    glitch = frame.copy()
+    for i in range(0, h, 20):
+        offset = random.randint(-10, 10)
+        glitch[i:i+5, :] = np.roll(glitch[i:i+5, :], offset, axis=1)
+    return glitch
+
+def pixelate(frame, scale=10):
+    h, w = frame.shape[:2]
+    temp = cv2.resize(frame, (w // scale, h // scale), interpolation=cv2.INTER_LINEAR)
+    return cv2.resize(temp, (w, h), interpolation=cv2.INTER_NEAREST)
+
+# -------------------------------
+# Popup Video Player
+# -------------------------------
+def get_popup_overlay_generator(video_path, overlay_size=(640, 480)):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Error: Could not open popup video: {video_path}")
+        yield None
+        return
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = cv2.resize(frame, overlay_size)
+        yield frame
+    cap.release()
+    yield None
+
+# -------------------------------
+# Desktop Icon Class
+# -------------------------------
+class DesktopIcon:
+    def __init__(self, name, normal_path, highlighted_path, position, action=None,
+                 popup_video=None, popup_pos=None,
+                 orbit_center=(640, 360), orbit_radius=200, orbit_speed=0.8, initial_angle=0):
+
+        self.name = name
+        self.image = cv2.imread(normal_path, cv2.IMREAD_UNCHANGED)
+        self.highlighted_image = cv2.imread(highlighted_path, cv2.IMREAD_UNCHANGED)
+        if self.image is None or self.highlighted_image is None:
+            raise FileNotFoundError(f"Could not load icon images for {name}")
+
+        self.position = position
+        self.action = action
+        self.popup_video = popup_video
+        self.popup_pos = popup_pos
+        self.width = self.image.shape[1]
+        self.height = self.image.shape[0]
+        self.selected = False
+        self.selected_time = 0.0
+        self.highlight_duration = 0.5
+
+        self.orbit_center = orbit_center
+        self.orbit_radius = orbit_radius
+        self.orbit_speed = orbit_speed
+        self.angle = initial_angle
+
+    def update_orbit(self, dt):
+        self.angle += self.orbit_speed * dt
+        cx, cy = self.orbit_center
+        x = int(cx + self.orbit_radius * np.cos(self.angle))
+        y = int(cy - self.orbit_radius * np.sin(self.angle))
+        self.position = (x, y)
+
+    def draw(self, frame):
+        if self.selected and time.time() - self.selected_time > self.highlight_duration:
+            self.selected = False
+        img_to_draw = self.highlighted_image if self.selected else self.image
+        x, y = self.position
+        return draw_cursor(frame, x + self.width // 2, y + self.height // 2, img_to_draw)
+
+    def is_hovered(self, cursor_x, cursor_y):
+        x, y = self.position
+        return (x <= cursor_x <= x + self.width) and (y <= cursor_y <= y + self.height)
+
+    def click(self, trigger_popup):
+        self.selected = True
+        self.selected_time = time.time()
+        if self.action:
+            self.action()
+        if self.popup_video:
+            trigger_popup(self.popup_video, self.popup_pos)
+
+# -------------------------------
+# Final Video Player
+# -------------------------------
+def play_fullscreen_video(video_path, window_name, frame_delay_ms):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Error: Could not open final video: {video_path}")
+        return
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        cv2.imshow(window_name, frame)
+        if cv2.waitKey(frame_delay_ms) & 0xFF == ord('|'):
+            break
+    cap.release()
+
+# -------------------------------
+# Main
+# -------------------------------
+def main():
+    global mouse_clicked, dragging, drag_start, drag_end
+
+    video_path = asset("desktopxp.mp4")
+    cursor_image_path = asset("cursor2.png")
+    final_video_path = asset("final_sequence.mp4")
+
+    window_name = "Interactive Desktop"
+    osc_ip = "127.0.0.1"
+    osc_port = 57120
+    osc_address = "/cursor"
+    normalize_osc = True
+
+    cursor_img = cv2.imread(cursor_image_path, cv2.IMREAD_UNCHANGED)
+    if cursor_img is None:
+        print(f"Error: Could not load cursor image: {cursor_image_path}")
+        return
+
+    last_osc_time = 0.0
+    screen_w, screen_h = pyautogui.size()
+    global sc_client
+    sc_client = SimpleUDPClient(osc_ip, osc_port)
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Error: Could not open video file: {video_path}")
+        return
+
+    src_fps = cap.get(cv2.CAP_PROP_FPS)
+    if not src_fps or src_fps <= 1.0:
+        src_fps = 30.0
+    frame_delay_ms = int(1000.0 / src_fps)
+
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(window_name, on_mouse)
+
+    ret, init_frame = cap.read()
+    if not ret:
+        print("Error reading initial frame.")
+        return
+
+    h, w = init_frame.shape[:2]
+    ctx, prog, vao, fbo = create_glsl_context(w, h)
+
+    # -------------------------------
+    # FIXED: popup variables must be defined BEFORE trigger_popup()
+    # -------------------------------
+    popup_overlay_gen = None
+    popup_overlay_active = False
+    popup_overlay_frame = None
+    popup_overlay_pos = (w // 2 - 320, h // 2 - 240)  # DEFAULT VALUE
+
+    def trigger_popup(video_path, position=None):
+        nonlocal popup_overlay_gen, popup_overlay_active, popup_overlay_pos
+        if popup_overlay_active:
+            return
+        popup_overlay_gen = get_popup_overlay_generator(video_path, (640, 480))
+        popup_overlay_active = True
+        popup_overlay_pos = position if position else (w // 2 - 320, h // 2 - 240)
+
+    center = (w // 2, h // 2)
+
+    icons = [
+        DesktopIcon(
+            "Fish",
+            asset("fish.png"),
+            asset("fish_highlighted.png"),
+            (0, 0),
+            popup_video=asset("fishpopup.mp4"),
+            orbit_center=center, orbit_radius=220, orbit_speed=0.2, initial_angle=0
+        ),
+        DesktopIcon(
+            "Trash Can",
+            asset("trash_can.png"),
+            asset("trash_can_highlighted.png"),
+            (0, 0),
+            popup_video=asset("trashpopup.mp4"),
+            orbit_center=center, orbit_radius=220, orbit_speed=0.2, initial_angle=2.094
+        ),
+        DesktopIcon(
+            "Media Player",
+            asset("media_player.png"),
+            asset("media_player_highlighted.png"),
+            (0, 0),
+            popup_video=asset("dancepopup.mp4"),
+            orbit_center=center, orbit_radius=220, orbit_speed=0.2, initial_angle=4.188
+        )
+    ]
+
+    click_counter = 0
+    CLICKS_TO_TRIGGER = 30
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            continue
+
+        frame_h, frame_w = frame.shape[:2]
+        cursor_x, cursor_y = pyautogui.position()
+        x_scaled = int(cursor_x / screen_w * frame_w)
+        y_scaled = int(cursor_y / screen_h * frame_h)
+
+        # OSC throttled sending
+        now = time.time()
+        max_send_rate = min(src_fps, 60.0)
+        min_interval = 1.0 / max_send_rate
+        if now - last_osc_time >= min_interval:
+            if normalize_osc:
+                osc_x = float(x_scaled) / float(frame_w)
+                osc_y = float(y_scaled) / float(frame_h)
+            else:
+                osc_x, osc_y = x_scaled, y_scaled
+            try:
+                sc_client.send_message(osc_address, [osc_x, osc_y])
+            except Exception as e:
+                print(f"Error sending OSC ({osc_address}): {e}")
+            last_osc_time = now
+
+        dt = 1.0 / src_fps
+
+        for icon in icons:
+            icon.orbit_center = (frame_w // 2.5, frame_h // 2.5)
+            icon.update_orbit(dt)
+
+        # Count clicks
+        if mouse_clicked:
+            click_counter += 1
+            print(f"Click count: {click_counter}")
+
+            for icon in icons:
+                if icon.is_hovered(x_scaled, y_scaled):
+                    icon.click(trigger_popup)
+
+            mouse_clicked = False
+
+        # Final sequence
+        if click_counter >= CLICKS_TO_TRIGGER:
+            print("🎬 30 clicks reached — playing final sequence.")
+            black = np.zeros_like(frame)
+            cv2.imshow(window_name, black)
+            cv2.waitKey(500)
+            play_fullscreen_video(final_video_path, window_name, frame_delay_ms)
+            click_counter = 0
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            continue
+
+        # Draw icons
+        for icon in icons:
+            frame = icon.draw(frame)
+
+        # Popup overlay
+        if popup_overlay_active:
+            popup_frame = next(popup_overlay_gen, None)
+            if popup_frame is not None:
+                px, py = popup_overlay_pos
+                ph, pw = popup_frame.shape[:2]
+                if 0 <= py < frame_h - ph and 0 <= px < frame_w - pw:
+                    frame[py:py+ph, px:px+pw] = popup_frame
+            else:
+                popup_overlay_active = False
+                popup_overlay_gen = None
+
+        # Draw cursor
+        # frame = draw_cursor(frame, x_scaled, y_scaled, cursor_img)
+
+        cv2.imshow(window_name, frame)
+
+        if cv2.waitKey(frame_delay_ms) & 0xFF == ord('|'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
